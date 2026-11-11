@@ -21,7 +21,17 @@ def spy_backends(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("key", list(videogen.PROVIDERS))
+PAID = [k for k, p in videogen.PROVIDERS.items() if p.est_cost_usd > 0]
+
+
+def test_local_runs_without_confirm_or_token(spy_backends, tmp_path):
+    out = tmp_path / "v.mp4"
+    assert videogen.main(["a cat", "-p", "local", "-o", str(out)]) == 0
+    assert out.read_bytes() == b"MP4DATA"
+    assert spy_backends == [("local", "a cat", "")]
+
+
+@pytest.mark.parametrize("key", PAID)
 def test_dry_run_cli_never_calls_backend(key, spy_backends, capsys):
     assert videogen.main(["a cat", "-p", key]) == 0
     assert spy_backends == []

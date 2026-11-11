@@ -66,6 +66,17 @@ PROVIDERS: dict[str, Provider] = {
         pricing_note="about $0.023 per output second at 360p",
         free_tier="No: video generation requires a billing-enabled project",
     ),
+    "local": Provider(
+        key="local",
+        label="Local CPU (AnimateDiff-Lightning on SD 1.5, no API)",
+        env_var="",
+        model="ByteDance/AnimateDiff-Lightning + emilianJR/epiCRealism",
+        # AnimateDiff's motion context is 16 frames; ffmpeg interpolates them to 5 s at 24 fps.
+        params={"steps": 4, "frames": 16, "width": 512, "height": 512, "fps": 24},
+        est_cost_usd=0.0,
+        pricing_note="free: runs on this machine (several minutes on CPU, ~4 GB download on first run)",
+        free_tier="Yes: open weights, no account or API key needed",
+    ),
 }
 
 
@@ -86,7 +97,9 @@ def plan(provider_key: str, prompt: str) -> dict[str, Any]:
         "prompt": prompt,
         "params": p.params,
         "duration_seconds": DURATION_SECONDS,
-        "credential": f"{p.env_var} ({'set' if os.environ.get(p.env_var) else 'NOT set'})",
+        "credential": (
+            f"{p.env_var} ({'set' if os.environ.get(p.env_var) else 'NOT set'})" if p.env_var else "none needed"
+        ),
         "estimated_cost_usd": p.est_cost_usd,
         "pricing_note": p.pricing_note,
         "free_tier": p.free_tier,
@@ -133,21 +146,64 @@ def _gemini(p: Provider, prompt: str, token: str) -> bytes:
     return client.files.download(file=video.uri)
 
 
+def _local(p: Provider, prompt: str, _token: str) -> bytes:
+    import subprocess
+    import tempfile
+
+    import torch
+    from diffusers import AnimateDiffPipeline, EulerDiscreteScheduler, MotionAdapter
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    cfg = p.params
+    adapter = MotionAdapter()
+    ckpt = hf_hub_download("ByteDance/AnimateDiff-Lightning", f"animatediff_lightning_{cfg['steps']}step_diffusers.safetensors")
+    adapter.load_state_dict(load_file(ckpt, device="cpu"))
+    pipe = AnimateDiffPipeline.from_pretrained("emilianJR/epiCRealism", motion_adapter=adapter, torch_dtype=torch.float32)
+    pipe.scheduler = EulerDiscreteScheduler.from_config(
+        pipe.scheduler.config, timestep_spacing="trailing", beta_schedule="linear"
+    )
+    frames = pipe(
+        prompt=prompt,
+        num_frames=cfg["frames"],
+        width=cfg["width"],
+        height=cfg["height"],
+        guidance_scale=1.0,  # Lightning checkpoints are distilled for CFG-free sampling
+        num_inference_steps=cfg["steps"],
+    ).frames[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, frame in enumerate(frames):
+            frame.save(f"{tmp}/f{i:03d}.png")
+        out = f"{tmp}/out.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-framerate", str(len(frames) / DURATION_SECONDS), "-i", f"{tmp}/f%03d.png",
+                "-vf", f"minterpolate=fps={cfg['fps']}:mi_mode=mci",
+                "-t", str(DURATION_SECONDS), "-pix_fmt", "yuv420p", out,
+            ],
+            check=True,
+        )
+        return Path(out).read_bytes()
+
+
 BACKENDS: dict[str, Callable[[Provider, str, str], bytes]] = {
     "huggingface": _hf,
     "replicate": _replicate,
     "gemini": _gemini,
+    "local": _local,
 }
 
 
 def generate(provider_key: str, prompt: str, out: Path, *, approved: bool) -> Path:
-    """Call the provider and save the MP4. Refuses to run unless approved=True."""
+    """Generate and save the MP4. Paid providers refuse to run unless approved=True."""
     plan(provider_key, prompt)
-    if not approved:
-        raise ApprovalRequired("Paid API call blocked: re-run with --confirm to approve the charge")
     p = PROVIDERS[provider_key]
-    token = os.environ.get(p.env_var)
-    if not token:
+    if p.est_cost_usd > 0 and not approved:
+        raise ApprovalRequired("Paid API call blocked: re-run with --confirm to approve the charge")
+    token = os.environ.get(p.env_var, "") if p.env_var else ""
+    if p.env_var and not token:
         raise RuntimeError(f"{p.env_var} is not set")
     data = BACKENDS[provider_key](p, prompt, token)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -203,7 +259,7 @@ def make_handler(out_dir: Path) -> type[BaseHTTPRequestHandler]:
             approved = form.get("approve", [""])[0] == "1"
             try:
                 details = plan(provider, prompt)
-                if not approved:
+                if not approved and PROVIDERS[provider].est_cost_usd > 0:
                     result = "<h2>Dry run (nothing sent)</h2><pre>" + html.escape(json.dumps(details, indent=2)) + "</pre>"
                 else:
                     out = generate(provider, prompt, out_dir / f"video-{int(time.time())}.mp4", approved=True)
@@ -234,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("prompt is required (or use --serve)")
 
     print(json.dumps(plan(args.provider, args.prompt), indent=2))
-    if not args.confirm:
+    if not args.confirm and PROVIDERS[args.provider].est_cost_usd > 0:
         print("\nDry run: nothing was sent. Add --confirm to make the real (possibly paid) call.")
         return 0
     path = generate(args.provider, args.prompt, args.out, approved=True)

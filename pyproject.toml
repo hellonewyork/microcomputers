@@ -9,8 +9,26 @@ dependencies = [
     "google-genai>=3.0",
 ]
 
+[project.optional-dependencies]
+# Free, offline CPU generation (`--provider local`).
+local = [
+    "torch>=2.4",
+    "diffusers>=0.30",
+    "transformers>=4.44",
+    "accelerate>=0.33",
+    "safetensors>=0.4",
+]
+
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
