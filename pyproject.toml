@@ -1,0 +1,16 @@
+[project]
+name = "videogen"
+version = "0.1.0"
+description = "Minimal 5-second text-to-video test (dry-run by default)"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface_hub>=1.0",
+    "replicate>=1.0",
+    "google-genai>=3.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
